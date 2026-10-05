@@ -1,0 +1,9 @@
+{
+  "name": "sp2redmine",
+  "version": "1.0.0",
+  "description": "Log Super Productivity tracked time to Redmine",
+  "type": "module",
+  "bin": { "sp2redmine": "sp2redmine.mjs" },
+  "engines": { "node": ">=20" },
+  "license": "MIT"
+}
