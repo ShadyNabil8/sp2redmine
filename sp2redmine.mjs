@@ -35,7 +35,7 @@ if (args.help) {
   --dry-run                preview only
   --include-manual         also log issue/days you already logged by hand
   -y, --yes                apply without asking
-  --activity <id|name>     Redmine time entry activity
+  --activity <id|name>     use this activity for all new entries (otherwise you are asked)
   --save-activity          remember --activity in ${CONFIG_PATH}
   --file <path>            use this SP backup/export instead of the latest backup
   --host <url>             override the Redmine host`);
@@ -130,21 +130,38 @@ async function redmine(method, path, body) {
   return json;
 }
 
-async function resolveActivity(value) {
-  if (!value) return undefined;
-  if (/^\d+$/.test(String(value))) return Number(value);
-  const { time_entry_activities: list } = await redmine('GET', '/enumerations/time_entry_activities.json');
-  const match = list.find((a) => a.name.trim().toLowerCase() === String(value).trim().toLowerCase());
-  if (!match) fail(`Unknown activity "${value}". Available: ${list.map((a) => `${a.id}=${a.name}`).join(', ')}`);
-  return match.id;
+let activitiesCache;
+async function getActivities() {
+  activitiesCache ??= (await redmine('GET', '/enumerations/time_entry_activities.json')).time_entry_activities
+    .filter((a) => a.active !== false)
+    .map((a) => ({ id: a.id, name: a.name.trim() }));
+  return activitiesCache;
 }
 
-async function printActivities() {
-  try {
-    const { time_entry_activities: list } = await redmine('GET', '/enumerations/time_entry_activities.json');
-    console.log(`\nAvailable activities: ${list.map((a) => `${a.id}=${a.name}${a.is_default ? ' (default)' : ''}`).join(', ')}`);
-    console.log('Re-run with e.g. --activity "<name>" --save-activity');
-  } catch {}
+// Match by id, exact name, or unique name prefix ("dev" -> Development). Returns { activity } or { error }.
+async function findActivity(value) {
+  const list = await getActivities();
+  const v = String(value).trim().toLowerCase();
+  if (/^\d+$/.test(v)) {
+    const byId = list.find((a) => a.id === Number(v));
+    return byId ? { activity: byId } : { error: `No activity with id ${v}` };
+  }
+  const exact = list.find((a) => a.name.toLowerCase() === v);
+  if (exact) return { activity: exact };
+  const prefixed = list.filter((a) => a.name.toLowerCase().startsWith(v));
+  if (prefixed.length === 1) return { activity: prefixed[0] };
+  if (prefixed.length > 1) return { error: `"${value}" matches ${prefixed.map((a) => a.name).join(', ')}` };
+  return { error: `Unknown activity "${value}" (type ? to list all)` };
+}
+
+async function resolveActivity(value) {
+  const { activity, error } = await findActivity(value);
+  if (error) fail(error);
+  return activity.id;
+}
+
+async function activityName(id) {
+  return (await getActivities()).find((a) => a.id === id)?.name ?? `#${id}`;
 }
 
 const me = (await redmine('GET', '/users/current.json')).user;
@@ -183,6 +200,32 @@ for (const [key, entry] of markedEntries) {
 }
 rows.sort((a, b) => a.date.localeCompare(b.date) || a.issue.localeCompare(b.issue, undefined, { numeric: true }));
 
+// ---------- activities ----------
+// New entries need an activity. Default per issue: --activity, then the one remembered for the
+// issue, then the one on your latest Redmine entry for the issue, then the saved global one.
+const creates = rows.filter((r) => r.action === 'create');
+const forcedActivity = args.activity ? await resolveActivity(args.activity) : undefined;
+let topActivities = [];
+if (creates.length) {
+  const recent = (await redmine('GET', `/time_entries.json?user_id=${me.id}&limit=100`)).time_entries; // newest first
+  const lastByIssue = new Map();
+  const usage = new Map();
+  for (const e of recent) {
+    if (e.issue && !lastByIssue.has(String(e.issue.id))) lastByIssue.set(String(e.issue.id), e.activity.id);
+    usage.set(e.activity.id, (usage.get(e.activity.id) ?? 0) + 1);
+  }
+  const known = new Set((await getActivities()).map((a) => a.id));
+  const fallback = config.activity ? await resolveActivity(config.activity) : undefined;
+  for (const r of creates) {
+    const id = forcedActivity ?? config.issueActivities?.[r.issue] ?? lastByIssue.get(r.issue) ?? fallback;
+    r.activityId = known.has(id) ? id : undefined;
+  }
+  topActivities = (await Promise.all(
+    [...usage].filter(([id]) => known.has(id)).sort((a, b) => b[1] - a[1]).slice(0, 8).map(async ([id]) => ({ id, name: await activityName(id) }))
+  ));
+}
+for (const r of creates) r.activityName = r.activityId ? await activityName(r.activityId) : '?';
+
 // ---------- preview ----------
 const pad = (s, n) => String(s).padEnd(n).slice(0, n);
 const padL = (s, n) => String(s).padStart(n);
@@ -192,8 +235,8 @@ console.log(`Range:    ${from}${to !== from ? ` .. ${to}` : ''}\n`);
 
 if (!rows.length) console.log('No Redmine-linked time in this range.');
 else {
-  console.log(`${pad('Date', 11)}${pad('Issue', 10)}${pad('Task', 46)}${padL('SP h', 7)}${padL('RM h', 7)}  Action`);
-  console.log('-'.repeat(92));
+  console.log(`${pad('Date', 11)}${pad('Issue', 10)}${pad('Task', 46)}${padL('SP h', 7)}${padL('RM h', 7)}  ${pad('Action', 11)}Activity`);
+  console.log('-'.repeat(110));
   let lastDate = null;
   let dayTotal = 0;
   const flush = () => lastDate && console.log(`${pad('', 67)}${padL(dayTotal.toFixed(2), 7)}  (${lastDate} total)\n`);
@@ -207,7 +250,7 @@ else {
     const manual = manualHours.get(r.key);
     const note = manual ? `  ${r.action === 'skip' ? '' : '! '}logged manually: ${round2(manual)}h` : '';
     console.log(
-      `${pad(r.date, 11)}${pad(`#${r.issue}`, 10)}${pad(r.title, 46)}${padL(r.hours.toFixed(2), 7)}${padL(r.entry ? r.entry.hours.toFixed(2) : '-', 7)}  ${r.action}${note}`
+      `${pad(r.date, 11)}${pad(`#${r.issue}`, 10)}${pad(r.title, 46)}${padL(r.hours.toFixed(2), 7)}${padL(r.entry ? r.entry.hours.toFixed(2) : '-', 7)}  ${pad(r.action, 11)}${r.activityName ?? ''}${note}`
     );
   }
   flush();
@@ -226,44 +269,95 @@ if (args['dry-run']) {
   console.log(`\nDry run: ${changes.length} change(s) not applied.`);
   process.exit(0);
 }
-if (!args.yes) {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const answer = await rl.question(`\nApply ${changes.length} change(s)? [y/N] `);
-  rl.close();
-  if (!/^y(es)?$/i.test(answer.trim())) {
-    console.log('Aborted.');
-    process.exit(0);
+// The line iterator buffers input, so piped answers aren't lost; EOF aborts.
+let rl, lines;
+const ask = async (question) => {
+  rl ??= createInterface({ input: process.stdin, output: process.stdout, terminal: process.stdin.isTTY });
+  lines ??= rl[Symbol.asyncIterator]();
+  process.stdout.write(question);
+  const { value, done } = await lines.next();
+  if (done) abort();
+  if (!process.stdin.isTTY) process.stdout.write(`${value}\n`);
+  return value.trim();
+};
+const abort = () => {
+  console.log('\nAborted.');
+  process.exit(0);
+};
+
+// Shortlist of your most-used activities; also accepts any id/name, "?" lists all.
+async function pickActivity(defaultId) {
+  const shortlist = topActivities.map((a, i) => `${i + 1}) ${a.name}`).join('  ');
+  if (shortlist) console.log(`    ${shortlist}`);
+  const hint = defaultId ? `Enter = ${await activityName(defaultId)}` : 'number, name or ?';
+  for (;;) {
+    const input = await ask(`    Activity [${hint}]: `);
+    if (!input) {
+      if (defaultId) return defaultId;
+      continue;
+    }
+    if (input === '?') {
+      console.log((await getActivities()).map((a) => `      ${padL(a.id, 5)}  ${a.name}`).join('\n'));
+      continue;
+    }
+    const n = Number(input);
+    if (Number.isInteger(n) && n >= 1 && n <= topActivities.length) return topActivities[n - 1].id;
+    const { activity, error } = await findActivity(input);
+    if (activity) return activity.id;
+    console.log(`    ${error}`);
   }
 }
 
-// ---------- apply ----------
-const activityId = await resolveActivity(args.activity ?? config.activity);
-if (args['save-activity'] && args.activity) {
-  writeFileSync(CONFIG_PATH, JSON.stringify({ ...config, activity: args.activity }, null, 2));
-  console.log(`Saved activity "${args.activity}" to ${CONFIG_PATH}`);
-}
+const describe = (r) => `${r.date} #${r.issue} ${r.title.slice(0, 50)} ${r.hours.toFixed(2)}h`;
+const missing = creates.filter((r) => !r.activityId);
 
+if (args.yes) {
+  if (missing.length) fail(`${missing.length} new entr${missing.length > 1 ? 'ies have' : 'y has'} no activity. Run without -y to choose, or pass --activity.`);
+} else if (!creates.length || forcedActivity) {
+  if (!/^y(es)?$/i.test(await ask(`\nApply ${changes.length} change(s)? [y/N] `))) abort();
+} else {
+  const answer = (await ask(`\nApply ${changes.length} change(s)? [y = yes · a = one activity for all · e = choose per entry · N = abort] `)).toLowerCase();
+  if (answer === 'a') {
+    console.log('\n  Activity for all new entries:');
+    const id = await pickActivity();
+    for (const r of creates) r.activityId = id;
+  } else if (answer === 'e' || ((answer === 'y' || answer === 'yes') && missing.length)) {
+    const toAsk = answer === 'e' ? creates : missing;
+    if (answer !== 'e') console.log(`\n  ${missing.length} entr${missing.length > 1 ? 'ies need' : 'y needs'} an activity:`);
+    for (const r of toAsk) {
+      console.log(`\n  ${describe(r)}`);
+      r.activityId = await pickActivity(r.activityId);
+    }
+  } else if (answer !== 'y' && answer !== 'yes') abort();
+  console.log('');
+}
+rl?.close();
+
+// ---------- apply ----------
 let failed = 0;
-let activityMissing = false;
+const remembered = { ...config.issueActivities };
 for (const r of changes) {
   const label = `${r.date} #${r.issue} ${r.hours.toFixed(2)}h`;
   try {
     if (r.action === 'create') {
-      const time_entry = { issue_id: Number(r.issue), spent_on: r.date, hours: r.hours, comments: MARKER };
-      if (activityId) time_entry.activity_id = activityId;
+      const time_entry = { issue_id: Number(r.issue), spent_on: r.date, hours: r.hours, comments: MARKER, activity_id: r.activityId };
       const { time_entry: created } = await redmine('POST', '/time_entries.json', { time_entry });
-      console.log(`  created  ${label}  (entry ${created.id})`);
+      remembered[r.issue] = r.activityId;
+      console.log(`  created  ${label}  ${await activityName(r.activityId)}  (entry ${created.id})`);
     } else {
       await redmine('PUT', `/time_entries/${r.entry.id}.json`, { time_entry: { hours: r.hours } });
       console.log(`  updated  ${label}  (entry ${r.entry.id}, was ${r.entry.hours}h)`);
     }
   } catch (err) {
     failed++;
-    if (err.errors?.some((e) => /activity/i.test(e))) activityMissing = true;
     console.log(`  FAILED   ${label}  ${err.message}`);
   }
 }
-if (activityMissing) await printActivities();
+
+const newConfig = { ...config, issueActivities: remembered };
+if (args['save-activity'] && args.activity) newConfig.activity = args.activity;
+if (JSON.stringify(newConfig) !== JSON.stringify(config)) writeFileSync(CONFIG_PATH, JSON.stringify(newConfig, null, 2));
+
 console.log(`\nDone: ${changes.length - failed} applied, ${failed} failed.`);
 process.exit(failed ? 1 : 0);
 

@@ -20,8 +20,22 @@ sp2redmine --date 2026-10-04                 # one day
 sp2redmine --from 2026-09-27 --to 2026-10-01 # a range
 sp2redmine --dry-run                         # preview only
 sp2redmine -y                                # apply without asking
-sp2redmine --activity Development --save-activity   # set the activity once
+sp2redmine --activity Development            # one activity for all, no picker
 ```
+
+## Activities
+
+Every new entry needs an activity. The preview shows the activity each entry will get. It is taken from, in order:
+1. the activity you picked for that issue last time (saved in `~/.sp2redmine.json`)
+2. the activity of your latest Redmine entry on that issue
+3. a global default, if you saved one with `--activity X --save-activity`
+
+`?` means none was found. At the prompt:
+- `y`: apply. You're only asked about the `?` rows.
+- `a`: pick one activity for all new entries.
+- `e`: go through each new entry. Enter keeps the shown activity.
+
+The picker lists your most-used activities by number. You can also type an id, a name, or the start of a name (`dev`, `code rev`). Type `?` to list them all. Whatever you pick is remembered for that issue.
 
 Notes:
 - SP refreshes its backup file every so often. If you just tracked time, wait a few minutes, or export your data from SP and pass it with `--file <export.json>`.
