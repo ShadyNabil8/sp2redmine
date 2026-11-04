@@ -21,6 +21,7 @@ const { values: args } = parseArgs({
     host: { type: 'string' },
     activity: { type: 'string' },
     'save-activity': { type: 'boolean' },
+    guess: { type: 'boolean' },
     'dry-run': { type: 'boolean' },
     'include-manual': { type: 'boolean' },
     yes: { type: 'boolean', short: 'y' },
@@ -37,6 +38,7 @@ if (args.help) {
   -y, --yes                apply without asking
   --activity <id|name>     use this activity for all new entries (otherwise you are asked)
   --save-activity          remember --activity in ${CONFIG_PATH}
+  --guess                  guess the activity for issues with none known (not remembered)
   --file <path>            use this SP backup/export instead of the latest backup
   --host <url>             override the Redmine host`);
   process.exit(0);
@@ -223,8 +225,55 @@ if (creates.length) {
   topActivities = (await Promise.all(
     [...usage].filter(([id]) => known.has(id)).sort((a, b) => b[1] - a[1]).slice(0, 8).map(async ([id]) => ({ id, name: await activityName(id) }))
   ));
+  const knownFor = (issue) => [config.issueActivities?.[issue], lastByIssue.get(issue)].find((id) => known.has(id));
+  if (args.guess) await guessActivities(creates.filter((r) => !r.activityId), knownFor);
 }
-for (const r of creates) r.activityName = r.activityId ? await activityName(r.activityId) : '?';
+for (const r of creates) r.activityName = r.activityId ? `${await activityName(r.activityId)}${r.guessed ? ' (guess)' : ''}` : '?';
+
+// Guess, in order: the activity of another issue whose SP title is the same once sprint/story
+// prefixes are dropped ("R05_Planning" -> what you used on "R04_Planning"); keyword rules on the
+// SP title, Redmine subject and tracker (first rule whose activity exists wins); your most-used one.
+async function guessActivities(rowsToGuess, knownFor) {
+  if (!rowsToGuess.length) return;
+  const normTitle = (s) => s.toLowerCase().replace(/_+/g, ' ').replace(/\b(r|sp|us|s)\d+\b/g, ' ').replace(/[^\p{L}]+/gu, ' ').trim();
+  const sameTitle = new Map(); // normalized title -> activity id
+  for (const t of tasks) {
+    const issue = issueOf(t);
+    const id = issue && knownFor(issue);
+    const norm = issue && normTitle(t.title.replace(/^#\d+\s*/, ''));
+    if (id && norm && !sameTitle.has(norm)) sameTitle.set(norm, id);
+  }
+  const issues = new Map();
+  try {
+    const ids = [...new Set(rowsToGuess.map((r) => r.issue))].join(',');
+    for (const i of (await redmine('GET', `/issues.json?issue_id=${ids}&status_id=*&limit=100`)).issues) issues.set(String(i.id), i);
+  } catch {} // titles alone are still enough to guess
+  const rules = [
+    [/meeting/i, /\b(meetings?|stand-?ups?|planning|retro(spective)?|grooming|refinement|huddle|1:1|demo)\b/i, 'Meeting'],
+    [null, /\b(code[- ]?review|review|pr|mr|merge request|pull request)\b/i, 'Code review'],
+    [/bug/i, /\b(bugs?|fix(es|ed|ing)?|hotfix|crash(es|ing)?|broken|regression)\b/i, 'Bug fixing'],
+    [null, /\bdebug/i, 'Debugging'],
+    [/^test case$/i, /\b(unit|integration|e2e) tests?\b|\bwrite tests?\b|\btest writing\b/i, 'Test writing'],
+    [/testing/i, /\b(test(ing)?|qa|verify|verification)\b/i, 'Testing'],
+    [/^(support|critical support)$/i, /\bsupport\b/i, 'Support'],
+    [/documentation/i, /\b(docs?|documentation|readme)\b/i, 'Code documentation'],
+    [null, /\b(analy[sz](is|e|ing)|investigat\w*|research|spike|requirements?)\b/i, 'Analysis'],
+    [/training|course/i, /\b(training|learn(ing)?|course|workshop)\b/i, 'Training'],
+    [/maintenance/i, /\bmaintenance\b/i, 'Maintenance'],
+  ];
+  const list = await getActivities();
+  const byName = (name) => list.find((a) => a.name.toLowerCase() === name.toLowerCase())?.id;
+  const mostUsed = topActivities[0]?.id ?? byName('Development') ?? list[0]?.id;
+  for (const r of rowsToGuess) {
+    const issue = issues.get(r.issue);
+    const text = `${r.title} ${issue?.subject ?? ''}`.replace(/_+/g, ' '); // "R04_Standups" -> words
+    const tracker = issue?.tracker?.name ?? '';
+    const similar = [...r.titles].map((t) => sameTitle.get(normTitle(t))).find(Boolean);
+    const hit = rules.find(([trackerRe, textRe, name]) => byName(name) && ((trackerRe && trackerRe.test(tracker)) || textRe.test(text)));
+    r.activityId = similar ?? (hit ? byName(hit[2]) : mostUsed);
+    r.guessed = true;
+  }
+}
 
 // ---------- preview ----------
 const pad = (s, n) => String(s).padEnd(n).slice(0, n);
@@ -320,13 +369,14 @@ if (args.yes) {
   if (answer === 'a') {
     console.log('\n  Activity for all new entries:');
     const id = await pickActivity();
-    for (const r of creates) r.activityId = id;
+    for (const r of creates) Object.assign(r, { activityId: id, guessed: false });
   } else if (answer === 'e' || ((answer === 'y' || answer === 'yes') && missing.length)) {
     const toAsk = answer === 'e' ? creates : missing;
     if (answer !== 'e') console.log(`\n  ${missing.length} entr${missing.length > 1 ? 'ies need' : 'y needs'} an activity:`);
     for (const r of toAsk) {
       console.log(`\n  ${describe(r)}`);
       r.activityId = await pickActivity(r.activityId);
+      r.guessed = false;
     }
   } else if (answer !== 'y' && answer !== 'yes') abort();
   console.log('');
@@ -342,8 +392,8 @@ for (const r of changes) {
     if (r.action === 'create') {
       const time_entry = { issue_id: Number(r.issue), spent_on: r.date, hours: r.hours, comments: MARKER, activity_id: r.activityId };
       const { time_entry: created } = await redmine('POST', '/time_entries.json', { time_entry });
-      remembered[r.issue] = r.activityId;
-      console.log(`  created  ${label}  ${await activityName(r.activityId)}  (entry ${created.id})`);
+      if (!r.guessed) remembered[r.issue] = r.activityId;
+      console.log(`  created  ${label}  ${await activityName(r.activityId)}${r.guessed ? ' (guess)' : ''}  (entry ${created.id})`);
     } else {
       await redmine('PUT', `/time_entries/${r.entry.id}.json`, { time_entry: { hours: r.hours } });
       console.log(`  updated  ${label}  (entry ${r.entry.id}, was ${r.entry.hours}h)`);

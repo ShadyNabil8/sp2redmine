@@ -185,6 +185,23 @@ This applies everything without prompting. If any new entry has no known activit
 Error: 2 new entries have no activity. Run without -y to choose, or pass --activity.
 ```
 
+Add `--guess` to fill those in instead. It tries, in order: the activity of a same-named task from
+another sprint (`R05_Planning` gets what you used on `R04_Planning`), keywords in the title and the
+Redmine tracker (standup → Meeting, review → Code review, bug/fix → Bug fixing, …), then your
+most-used activity. Guesses show as `Development (guess)` and are **not** saved, so if you fix one in
+Redmine, your fix is what's used next time.
+
+### Every night at 10 PM
+
+```
+powershell -ExecutionPolicy Bypass -File scheduled\install-task.ps1
+```
+
+This registers the Windows task **sp2redmine daily** (22:00 local time, this PC must be on Cairo time).
+It runs `sp2redmine --from <yesterday> -y --guess`, so late work and a night the PC was off are picked up
+the next run. Output goes to `%LOCALAPPDATA%\sp2redmine\logs\<date>.log`.
+Remove it with `Unregister-ScheduledTask "sp2redmine daily"`.
+
 ---
 
 ## 11. Use an SP export instead of the auto backup
@@ -208,6 +225,7 @@ $ sp2redmine --file C:\Users\me\Downloads\super-productivity-backup.json
 | `sp2redmine -y`                           | apply without asking                   |
 | `sp2redmine --activity <name\|id>`        | one activity for all new entries       |
 | `… --save-activity`                       | remember `--activity` as the fallback  |
+| `sp2redmine --guess`                      | guess unknown activities, don't ask    |
 | `sp2redmine --include-manual`             | log days you already logged by hand    |
 | `sp2redmine --file <export.json>`         | read this file instead of the backup   |
 | `sp2redmine --host <url>`                 | another Redmine (key from `REDMINE_API_KEY`) |
