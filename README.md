@@ -193,14 +193,9 @@ Redmine, your fix is what's used next time.
 
 ### Every night at 10 PM
 
-```
-powershell -ExecutionPolicy Bypass -File scheduled\install-task.ps1
-```
-
-This registers the Windows task **sp2redmine daily** (22:00 local time, this PC must be on Cairo time).
-It runs `sp2redmine --from <yesterday> -y --guess`, so late work and a night the PC was off are picked up
-the next run. Output goes to `%LOCALAPPDATA%\sp2redmine\logs\<date>.log`.
-Remove it with `Unregister-ScheduledTask "sp2redmine daily"`.
+A Claude Code scheduled task (**sp2redmine: log time to Redmine**, under *Scheduled* in the Claude app)
+runs `sp2redmine --from <yesterday> -y --guess` every day at 22:00. Including yesterday picks up late
+work and nights the app was closed.
 
 ---
 
